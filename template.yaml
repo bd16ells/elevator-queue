@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Template for Websockets API Gateway, an SQS queue, and permissions to enqueue from APIG.
+
+Parameters:
+  env:
+    Description: Environment Name
+    Type: String
+    Default: "dev"
+
+
+Resources:
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: API Endpoint to receive JSON payloads and queue in SQS, also handle any other endpoints as needed.
+      Name: APIGateway
+
+  APIGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                apigateway.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource: !GetAtt 'ElevatorQueue.Arn'
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: '*'
+            Version: '2012-10-17'
+          PolicyName: apig-sqs-send-msg-policy
+      RoleName: apig-sqs-send-msg-role
+
+  ElevatorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${env}-elevator-queue.fifo'
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 600
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 15
+      FifoQueue:  true
+
+  ElevatorQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: SQS:*
+            Effect: Allow
+            Principal: '*'
+            Resource: !GetAtt 'ElevatorQueue.Arn'
+        Version: '2012-10-17'
+      Queues:
+        - !Ref 'ElevatorQueue'
+
+  PostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Credentials: !GetAtt 'APIGatewayRole.Arn'
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
+        RequestTemplates:
+          application/json: Action=SendMessage&MessageGroupId=$input.params('MessageGroupId')&MessageDeduplicationId=$input.params('MessageDeduplicationId')&MessageBody=$input.body
+        Type: AWS
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - :sqs:path/
+            - !Ref 'AWS::AccountId'
+            - /
+            - !Sub '${env}-elevator-queue.fifo'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          StatusCode: '200'
+      ResourceId: !Ref 'enqueueResource'
+      RestApiId: !Ref 'APIGateway'
+
+  enqueueResource:
+    Properties:
+      ParentId: !Ref 'APIGv1Resource'
+      PathPart: enqueue
+      RestApiId: !Ref 'APIGateway'
+    Type: AWS::ApiGateway::Resource
+
+  APIGdeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: PostMethod
+    Properties:
+      RestApiId: !Ref 'APIGateway'
+
+  APIGstage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref 'APIGdeployment'
+      RestApiId: !Ref 'APIGateway'
+      StageName: !Sub '${env}'
+
+  APIGv1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt 'APIGateway.RootResourceId'
+      PathPart: v1
+      RestApiId: !Ref 'APIGateway'
+
+################# START WEBSOCKETS #####################
+  ElevatorWebSocket:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: ElevatorWebSocket
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectInteg
+  
+  ConnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DisconnectInteg
+
+  DisconnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFunction.Arn}/invocations
+
+  SendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      RouteKey: sendmessage
+      AuthorizationType: NONE
+      OperationName: SendRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref SendInteg
+
+  SendInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+      Description: Send Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - ConnectRoute
+    - SendRoute
+    - DisconnectRoute
+    Properties:
+      ApiId: !Ref ElevatorWebSocket
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: Prod
+      Description: Prod Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref ElevatorWebSocket
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+          - AttributeName: 'PK'
+            AttributeType: S
+          - AttributeName: 'SK'
+            AttributeType: S
+      KeySchema:
+          - AttributeName: 'PK'
+            KeyType: HASH
+          - AttributeName: 'SK'
+            KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: 'GSI1'
+          KeySchema:
+            - AttributeName: 'SK'
+              KeyType: HASH
+            - AttributeName: 'PK'
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: True
+      TableName: !Sub '${env}-elevator'
+
+  OnConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: onconnect/
+      Handler: app.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub '${env}-elevator'
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Sub '${env}-elevator'
+
+  OnConnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ElevatorWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  OnDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ondisconnect/
+      Handler: app.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub '${env}-elevator'
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Sub '${env}-elevator'
+
+  OnDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ElevatorWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnDisconnectFunction
+      Principal: apigateway.amazonaws.com
+  
+  SendMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: sendmessage/
+      Handler: main.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub '${env}-elevator'
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ElevatorQueue.Arn
+            BatchSize: 1
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Sub '${env}-elevator'
+      - SQSPollerPolicy:
+          QueueName:
+            !GetAtt ElevatorQueue.QueueName
+      - Statement:
+        - Effect: Allow
+          Action:
+          - 'execute-api:*'
+          # fix above
+          Resource:
+          - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ElevatorWebSocket}/*'
+  
+  SendMessagePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ElevatorWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendMessageFunction
+      Principal: apigateway.amazonaws.com
+
+      #########################################
+      ### queue trigger lambda send ###########
+
+  # LambdaFunctionEventSourceMapping:
+  #   Type: AWS::Lambda::EventSourceMapping
+  #   Properties:
+  #     BatchSize: 10
+  #     Enabled: true
+  #     EventSourceArn: !GetAtt ElevatorQueue.Arn
+  #     FunctionName: !GetAtt SendMessageFunction.Arn
+
+
+Outputs:
+  RestApiEndpoint:
+    Description: Endpoint for this stage of the api
+    Value: !Join
+      - ''
+      - - https://
+        - !Ref 'APIGateway'
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .amazonaws.com/
+        - !Sub '${env}'
+
+  QueueArnSQS:
+    Description: ARN of SQS Queue
+    Value: !GetAtt 'ElevatorQueue.Arn'
+
+  ConnectionsTableArn:
+    Description: "Connections table ARN"
+    Value: !GetAtt ConnectionsTable.Arn
+
+  OnConnectFunctionArn:
+    Description: "OnConnect function ARN"
+    Value: !GetAtt OnConnectFunction.Arn
+
+  OnDisconnectFunctionArn:
+    Description: "OnDisconnect function ARN"
+    Value: !GetAtt OnDisconnectFunction.Arn
+
+  SendMessageFunctionArn:
+    Description: "SendMessage function ARN"
+    Value: !GetAtt SendMessageFunction.Arn
+
+  WebSocketURI:
+    Description: "The WSS Protocol URI to connect to"
+    Value: !Join [ '', [ 'wss://', !Ref ElevatorWebSocket, '.execute-api.',!Ref 'AWS::Region','.amazonaws.com/',!Ref 'Stage'] ]
